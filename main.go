@@ -18,7 +18,7 @@ type NetflixShow struct {
 	Type        string
 	Title       string
 	Director    *string
-	Cast        *string
+	CastMembers *string
 	Country     *string
 	DateAdded   *time.Time
 	ReleaseYear int
@@ -91,7 +91,7 @@ func fetchNetflixShows() ([]NetflixShow, error) {
 			&show.Type,
 			&show.Title,
 			&show.Director,
-			&show.Cast,
+			&show.CastMembers,
 			&show.Country,
 			&show.DateAdded,
 			&show.ReleaseYear,
@@ -116,7 +116,7 @@ func createExcelFile(shows []NetflixShow) (*excelize.File, error) {
 		return nil, fmt.Errorf("stream writer error: %w", err)
 	}
 
-	headers := []any{"Show ID", "Type", "Title", "Director", "Cast", "Country",
+	headers := []any{"Show ID", "Type", "Title", "Director", "Cast Members", "Country",
 		"Date Added", "Release Year", "Rating", "Duration", "Listed In", "Description"}
 	if err := sw.SetRow("A1", headers); err != nil {
 		return nil, fmt.Errorf("header write error: %w", err)
@@ -129,7 +129,7 @@ func createExcelFile(shows []NetflixShow) (*excelize.File, error) {
 			show.Type,
 			show.Title,
 			show.Director,
-			show.Cast,
+			show.CastMembers,
 			show.Country,
 			show.DateAdded,
 			show.ReleaseYear,
