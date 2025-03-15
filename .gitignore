@@ -1,0 +1,20 @@
+# Environment variables
+.env
+
+# Compiled binary
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Output of the build process
+*.out
+
+# IDE/editor specific files
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
