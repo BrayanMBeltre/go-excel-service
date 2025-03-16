@@ -37,6 +37,7 @@ type NetflixShow struct {
 }
 
 var db *gorm.DB
+var headers []string
 
 func setupDatabase() (*gorm.DB, error) {
 	if os.Getenv("DATABASE_URL") == "" {
@@ -62,6 +63,15 @@ func setupDatabase() (*gorm.DB, error) {
 	return db, nil
 }
 
+func getFieldTags(model any, tagName string) []string {
+	t := reflect.TypeOf(model)
+	tags := make([]string, t.NumField())
+	for i := range t.NumField() {
+		tags[i] = t.Field(i).Tag.Get(tagName)
+	}
+	return tags
+}
+
 func init() {
 	if err := godotenv.Load(); err != nil {
 		log.Printf("Warning: .env file not found, using environment variables")
@@ -72,6 +82,8 @@ func init() {
 	if err != nil {
 		log.Fatalf("Error setting up database: %v", err)
 	}
+
+	headers = getFieldTags(NetflixShow{}, "xlsx")
 }
 
 func main() {
@@ -80,14 +92,11 @@ func main() {
 	log.Fatal(http.ListenAndServe(serverAddress, nil))
 }
 
-func addHeaders(sheet *xlsx.Sheet, model any) {
-	t := reflect.TypeOf(model)
+func addHeaders(sheet *xlsx.Sheet, tags []string) {
 	row := sheet.AddRow()
-
-	for i := range t.NumField() {
-		field := t.Field(i)
+	for _, tag := range tags {
 		cell := row.AddCell()
-		cell.Value = field.Tag.Get("xlsx")
+		cell.Value = tag
 	}
 }
 
@@ -122,7 +131,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	addHeaders(sheet, NetflixShow{})
+	addHeaders(sheet, headers)
 	addRows(sheet, shows)
 
 	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
