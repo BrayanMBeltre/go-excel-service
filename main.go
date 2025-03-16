@@ -9,138 +9,127 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
-	"github.com/xuri/excelize/v2"
+	"github.com/tealeg/xlsx"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
+const (
+	serverAddress   = "localhost:8080"
+	maxOpenConns    = 25
+	maxIdleConns    = 5
+	connMaxLifetime = 5 * time.Minute
+)
+
 type NetflixShow struct {
-	ShowID      string
-	Type        string
-	Title       string
-	Director    string
-	CastMembers string
-	Country     string
-	DateAdded   time.Time
-	ReleaseYear int
-	Rating      string
-	Duration    string
-	ListedIn    string
-	Description string
+	ShowID      string    `xlsx:"Id"`
+	Type        string    `xlsx:"Type"`
+	Title       string    `xlsx:"Title"`
+	Director    string    `xlsx:"Director"`
+	CastMembers string    `xlsx:"Cast Members"`
+	Country     string    `xlsx:"Country"`
+	DateAdded   time.Time `xlsx:"Date Added"`
+	ReleaseYear int       `xlsx:"Release Year"`
+	Rating      string    `xlsx:"Rating"`
+	Duration    string    `xlsx:"Duration"`
+	ListedIn    string    `xlsx:"Listed In"`
+	Description string    `xlsx:"Description"`
 }
 
 var db *gorm.DB
+
+func setupDatabase() (*gorm.DB, error) {
+	if os.Getenv("DATABASE_URL") == "" {
+		return nil, fmt.Errorf("DATABASE_URL environment variable is required")
+	}
+
+	db, err := gorm.Open(postgres.Open(os.Getenv("DATABASE_URL")), &gorm.Config{
+		SkipDefaultTransaction: true,
+		PrepareStmt:            true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error connecting to database: %w", err)
+	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, fmt.Errorf("error getting database instance: %w", err)
+	}
+	sqlDB.SetMaxOpenConns(maxOpenConns)
+	sqlDB.SetMaxIdleConns(maxIdleConns)
+	sqlDB.SetConnMaxLifetime(connMaxLifetime)
+
+	return db, nil
+}
 
 func init() {
 	if err := godotenv.Load(); err != nil {
 		log.Printf("Warning: .env file not found, using environment variables")
 	}
 
-	if os.Getenv("DATABASE_URL") == "" {
-		log.Fatal("DATABASE_URL environment variable is required")
-	}
-
 	var err error
-	db, err = gorm.Open(postgres.Open(os.Getenv("DATABASE_URL")), &gorm.Config{
-		SkipDefaultTransaction: true,
-		PrepareStmt:            true,
-	})
+	db, err = setupDatabase()
 	if err != nil {
-		log.Fatalf("Error connecting to database: %v", err)
+		log.Fatalf("Error setting up database: %v", err)
 	}
-
-	sqlDB, err := db.DB()
-	if err != nil {
-		log.Fatalf("Error getting database instance: %v", err)
-	}
-	sqlDB.SetMaxOpenConns(25)
-	sqlDB.SetMaxIdleConns(5)
-	sqlDB.SetConnMaxLifetime(5 * time.Minute)
 }
 
 func main() {
 	http.HandleFunc("/export", handler)
 	log.Println("Server started on :8080")
-	log.Fatal(http.ListenAndServe("localhost:8080", nil))
+	log.Fatal(http.ListenAndServe(serverAddress, nil))
 }
 
-func GetStructFieldNames(input any) []string {
-	t := reflect.TypeOf(input)
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
+func addHeaders(sheet *xlsx.Sheet, model any) {
+	t := reflect.TypeOf(model)
+	row := sheet.AddRow()
 
-	if t.Kind() != reflect.Struct {
-		return nil
-	}
-
-	var fields []string
 	for i := range t.NumField() {
 		field := t.Field(i)
-		fields = append(fields, field.Name)
+		cell := row.AddCell()
+		cell.Value = field.Tag.Get("xlsx")
 	}
-	return fields
+}
+
+func addRows(sheet *xlsx.Sheet, shows []NetflixShow) {
+	for _, show := range shows {
+		row := sheet.AddRow()
+		v := reflect.ValueOf(show)
+		for i := range v.NumField() {
+			cell := row.AddCell()
+			cell.Value = fmt.Sprintf("%v", v.Field(i).Interface())
+		}
+	}
+}
+
+func handleError(w http.ResponseWriter, err error, message string, code int) {
+	log.Printf("%s: %v", message, err)
+	http.Error(w, message, code)
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
-
+	ctx := r.Context()
 	var shows []NetflixShow
-	if err := db.Find(&shows).Error; err != nil {
-		log.Printf("Error fetching netflix shows: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	if err := db.WithContext(ctx).Limit(10).Find(&shows).Error; err != nil {
+		handleError(w, err, "Error fetching Netflix shows", http.StatusInternalServerError)
 		return
 	}
 
-	columns := GetStructFieldNames(NetflixShow{})
-
-	f := excelize.NewFile()
-
-	sw, err := f.NewStreamWriter("Sheet1")
+	file := xlsx.NewFile()
+	sheet, err := file.AddSheet("Netflix Shows")
 	if err != nil {
-		log.Printf("Error creating excel file: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		handleError(w, err, "Error adding sheet", http.StatusInternalServerError)
 		return
 	}
 
-	headers := []any{}
-
-	for _, column := range columns {
-		headers = append(headers, column)
-	}
-
-	if err := sw.SetRow("A1", headers); err != nil {
-		log.Printf("Error writing headers: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	for i, show := range shows {
-		row := []any{}
-		val := reflect.ValueOf(show)
-		for _, column := range columns {
-			fieldVal := val.FieldByName(column)
-			row = append(row, fieldVal.Interface())
-		}
-		if err := sw.SetRow(fmt.Sprintf("A%d", i+2), row); err != nil {
-			log.Printf("Error writing row: %v", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	if err := sw.Flush(); err != nil {
-		log.Printf("Error flushing stream: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
+	addHeaders(sheet, NetflixShow{})
+	addRows(sheet, shows)
 
 	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 	w.Header().Set("Content-Disposition", "attachment; filename=netflix_shows.xlsx")
 
-	if err := f.Write(w); err != nil {
-		log.Printf("Error writing response: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	if err := file.Write(w); err != nil {
+		handleError(w, err, "Error writing response", http.StatusInternalServerError)
 		return
 	}
-
 }
