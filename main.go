@@ -1,19 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"reflect"
-	"strconv"
-	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
-	"github.com/tealeg/xlsx"
+	"github.com/xuri/excelize/v2"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -118,11 +115,11 @@ func init() {
 		log.Printf("Warning: .env file not found, using environment variables")
 	}
 
-	var err error
-	db, err = setupDatabase()
-	if err != nil {
-		log.Fatalf("Error setting up database: %v", err)
-	}
+	// var err error
+	// db, err = setupDatabase()
+	// if err != nil {
+	// 	log.Fatalf("Error setting up database: %v", err)
+	// }
 }
 
 func main() {
@@ -138,8 +135,8 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
-func getFieldTags(model any, tagName string) ([]string, error) {
-	var tags []string
+func getHeaders[T any](model T) ([]string, error) {
+	var headers []string
 	t := reflect.TypeOf(model)
 
 	if t == nil {
@@ -153,31 +150,24 @@ func getFieldTags(model any, tagName string) ([]string, error) {
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
 		if field.Type.Kind() == reflect.Struct && field.Anonymous {
-			nestedTags, err := getFieldTags(reflect.New(field.Type).Interface(), tagName)
+			nestedHeaders, err := getHeaders(reflect.New(field.Type).Interface())
 			if err != nil {
 				return nil, err
 			}
-			tags = append(tags, nestedTags...)
+			headers = append(headers, nestedHeaders...)
 		} else {
-			if tagValue := field.Tag.Get(tagName); tagValue != "" {
-				tags = append(tags, tagValue)
-			}
+			headers = append(headers, field.Tag.Get("xlsx"))
 		}
 	}
-	return tags, nil
+
+	return headers, nil
 }
 
-func addHeaders(sheet *xlsx.Sheet, tags []string) {
-	row := sheet.AddRow()
-	for _, tag := range tags {
-		cell := row.AddCell()
-		cell.Value = tag
-	}
-}
+func getRows[T any](data []T) ([][]interface{}, error) {
+	var rows [][]interface{}
 
-func addRows[T any](sheet *xlsx.Sheet, data []T) error {
 	for _, item := range data {
-		row := sheet.AddRow()
+		var row []interface{}
 		v := reflect.ValueOf(item)
 		if v.Kind() == reflect.Ptr {
 			v = v.Elem()
@@ -186,29 +176,16 @@ func addRows[T any](sheet *xlsx.Sheet, data []T) error {
 		for i := 0; i < v.NumField(); i++ {
 			field := v.Field(i)
 			if !field.IsValid() {
-				return fmt.Errorf("invalid field at position %d", i)
+				return nil, fmt.Errorf("invalid field at position %d", i)
 			}
 
-			// Handle nested structs
-			if field.Kind() == reflect.Struct && field.CanInterface() {
-				nested := field.Interface()
-				nv := reflect.ValueOf(nested)
-				for j := 0; j < nv.NumField(); j++ {
-					nestedField := nv.Field(j)
-					if nestedField.CanInterface() {
-						cell := row.AddCell()
-						cell.Value = fmt.Sprintf("%v", nestedField.Interface())
-					}
-				}
-			} else {
-				if field.CanInterface() {
-					cell := row.AddCell()
-					cell.Value = fmt.Sprintf("%v", field.Interface())
-				}
-			}
+			row = append(row, field.Interface())
 		}
+
+		rows = append(rows, row)
 	}
-	return nil
+
+	return rows, nil
 }
 
 func handleError(w http.ResponseWriter, err error, message string, code int) {
@@ -231,70 +208,80 @@ func elapseTime(message string) (start, end func()) {
 	return start, end
 }
 
-var bufferPool = sync.Pool{
-	New: func() interface{} {
-		return bytes.NewBuffer(make([]byte, 0, 4*1024*1024)) // 4MB buffer
-	},
-}
-
-func handler(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
-	defer cancel()
+func getData(ctx context.Context, w http.ResponseWriter) ([]Salary, error) {
+	start, end := elapseTime("Fetching data")
+	start()
 
 	var salaries []Salary
+
 	if err := db.WithContext(ctx).Find(&salaries).Error; err != nil {
 		handleError(w, err, "Error fetching salaries", http.StatusInternalServerError)
-		return
+		end()
+		return nil, err
 	}
 
-	file := xlsx.NewFile()
-	sheet, err := file.AddSheet("Salaries")
+	end()
+	return salaries, nil
+}
+
+func downloadFile[T any](w http.ResponseWriter, data []T) error {
+	start, end := elapseTime("Creating file")
+	start()
+
+	file := excelize.NewFile()
+	defer file.Close()
+
+	sheetName := "Sheet1"
+	_, err := file.NewSheet(sheetName)
+
 	if err != nil {
 		handleError(w, err, "Error creating sheet", http.StatusInternalServerError)
-		return
 	}
 
-	tags, err := getFieldTags(Salary{}, "xlsx")
+	// Set headers
+	headers, err := getHeaders(data[0])
 	if err != nil {
-		handleError(w, err, "Error getting field tags", http.StatusInternalServerError)
-		return
+		return fmt.Errorf("error getting field tags: %w", err)
+	}
+	file.SetSheetRow(sheetName, "A1", &headers)
+
+	// Add rows
+	rows, err := getRows(data)
+	if err != nil {
+		return fmt.Errorf("error getting rows: %w", err)
+	}
+	for i, row := range rows {
+		cell := fmt.Sprintf("A%d", i+2)
+		file.SetSheetRow(sheetName, cell, &row)
 	}
 
-	addHeaders(sheet, tags)
-
-	start, end := elapseTime("Adding rows")
-	start()
-	if err := addRows(sheet, salaries); err != nil {
-		handleError(w, err, "Error generating rows", http.StatusInternalServerError)
-		return
-	}
-	end()
-
-	// Get buffer from pool
-	buf := bufferPool.Get().(*bytes.Buffer)
-	defer bufferPool.Put(buf)
-	buf.Reset()
-
-	// Set headers before writing data
 	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 	w.Header().Set("Content-Disposition", "attachment; filename=salaries.xlsx")
 
-	// Stream directly to response with compression
-	startWriting, endWriting := elapseTime("Writing file")
-	startWriting()
+	file.Write(w)
 
-	// Write to buffer first
-	if err := file.Write(buf); err != nil {
-		handleError(w, err, "Error writing file", http.StatusInternalServerError)
+	end()
+
+	return nil
+}
+
+func handler(w http.ResponseWriter, r *http.Request) {
+	// ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	// defer cancel()
+
+	// data, err := getData(ctx, w)
+	// if err != nil {
+	// 	return
+	// }
+
+	data := []Salary{
+		{EmployeeId: 1, Amount: 1000, FromDate: time.Now(), ToDate: time.Now()},
+		{EmployeeId: 2, Amount: 2000, FromDate: time.Now(), ToDate: time.Now()},
+		{EmployeeId: 3, Amount: 3000, FromDate: time.Now(), ToDate: time.Now()},
+	}
+
+	if err := downloadFile(w, data); err != nil {
+		handleError(w, err, "Error streaming salaries", http.StatusInternalServerError)
 		return
 	}
-
-	// Set content length and copy from buffer
-	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
-	if _, err := buf.WriteTo(w); err != nil {
-		log.Printf("Error writing response: %v", err)
-	}
-
-	endWriting()
-
 }
