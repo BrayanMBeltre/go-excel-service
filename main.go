@@ -1,15 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"reflect"
+	"strconv"
 	"sync"
 	"time"
-
-	"context"
 
 	"github.com/joho/godotenv"
 	"github.com/tealeg/xlsx"
@@ -23,6 +24,51 @@ const (
 	maxIdleConns    = 5
 	connMaxLifetime = 5 * time.Minute
 )
+
+type Tabler interface {
+	TableName() string
+}
+
+func (Salary) TableName() string {
+	return "salary"
+}
+
+type Salary struct {
+	EmployeeId int       `xlsx:"Employee ID"`
+	Amount     float32   `xlsx:"Amount"`
+	FromDate   time.Time `xlsx:"From Date"`
+	ToDate     time.Time `xlsx:"To Date"`
+}
+
+func (Title) TableName() string {
+	return "title"
+}
+
+type Title struct {
+	EmployeeId int       `xlsx:"Employee ID"`
+	Title      string    `xlsx:"Title"`
+	FromDate   time.Time `xlsx:"From Date"`
+	ToDate     time.Time `xlsx:"To Date"`
+}
+
+func (Employee) TableName() string {
+	return "employee"
+}
+
+type Employee struct {
+	Id        int       `xlsx:"ID"`
+	BirthDate time.Time `xlsx:"Birth Date"`
+	FirstName string    `xlsx:"First Name"`
+	LastName  string    `xlsx:"Last Name"`
+	Gender    string    `xlsx:"Gender"`
+	HireDate  time.Time `xlsx:"Hire Date"`
+}
+
+type EmployeeSalary struct {
+	Employee
+	Salary
+	Title
+}
 
 type NetflixShow struct {
 	ShowID      string    `xlsx:"Id"`
@@ -40,9 +86,7 @@ type NetflixShow struct {
 }
 
 var (
-	db           *gorm.DB
-	excelHeaders []string
-	fieldIndexes []int
+	db *gorm.DB
 )
 
 func setupDatabase() (*gorm.DB, error) {
@@ -69,23 +113,6 @@ func setupDatabase() (*gorm.DB, error) {
 	return db, nil
 }
 
-func initFieldMetadata() {
-	t := reflect.TypeOf(NetflixShow{})
-
-	excelHeaders = make([]string, t.NumField())
-	fieldIndexes = make([]int, t.NumField())
-
-	for i := range t.NumField() {
-		field := t.Field(i)
-		if tag := field.Tag.Get("xlsx"); tag != "" {
-			excelHeaders[i] = tag
-		} else {
-			excelHeaders[i] = field.Name
-		}
-		fieldIndexes[i] = i
-	}
-}
-
 func init() {
 	if err := godotenv.Load(); err != nil {
 		log.Printf("Warning: .env file not found, using environment variables")
@@ -96,8 +123,6 @@ func init() {
 	if err != nil {
 		log.Fatalf("Error setting up database: %v", err)
 	}
-
-	initFieldMetadata()
 }
 
 func main() {
@@ -113,6 +138,35 @@ func main() {
 	log.Fatal(server.ListenAndServe())
 }
 
+func getFieldTags(model any, tagName string) ([]string, error) {
+	var tags []string
+	t := reflect.TypeOf(model)
+
+	if t == nil {
+		return nil, fmt.Errorf("nil model type")
+	}
+
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if field.Type.Kind() == reflect.Struct && field.Anonymous {
+			nestedTags, err := getFieldTags(reflect.New(field.Type).Interface(), tagName)
+			if err != nil {
+				return nil, err
+			}
+			tags = append(tags, nestedTags...)
+		} else {
+			if tagValue := field.Tag.Get(tagName); tagValue != "" {
+				tags = append(tags, tagValue)
+			}
+		}
+	}
+	return tags, nil
+}
+
 func addHeaders(sheet *xlsx.Sheet, tags []string) {
 	row := sheet.AddRow()
 	for _, tag := range tags {
@@ -121,32 +175,40 @@ func addHeaders(sheet *xlsx.Sheet, tags []string) {
 	}
 }
 
-func addRows(sheet *xlsx.Sheet, shows []NetflixShow) {
-	for _, show := range shows {
+func addRows[T any](sheet *xlsx.Sheet, data []T) error {
+	for _, item := range data {
 		row := sheet.AddRow()
-		v := reflect.ValueOf(show)
-		for i := range v.NumField() {
-			cell := row.AddCell()
-			cell.Value = fmt.Sprintf("%v", v.Field(i).Interface())
+		v := reflect.ValueOf(item)
+		if v.Kind() == reflect.Ptr {
+			v = v.Elem()
+		}
+
+		for i := 0; i < v.NumField(); i++ {
+			field := v.Field(i)
+			if !field.IsValid() {
+				return fmt.Errorf("invalid field at position %d", i)
+			}
+
+			// Handle nested structs
+			if field.Kind() == reflect.Struct && field.CanInterface() {
+				nested := field.Interface()
+				nv := reflect.ValueOf(nested)
+				for j := 0; j < nv.NumField(); j++ {
+					nestedField := nv.Field(j)
+					if nestedField.CanInterface() {
+						cell := row.AddCell()
+						cell.Value = fmt.Sprintf("%v", nestedField.Interface())
+					}
+				}
+			} else {
+				if field.CanInterface() {
+					cell := row.AddCell()
+					cell.Value = fmt.Sprintf("%v", field.Interface())
+				}
+			}
 		}
 	}
-}
-
-func addRowsWithGorutines(sheet *xlsx.Sheet, shows []NetflixShow) {
-	var wg sync.WaitGroup
-	for _, show := range shows {
-		wg.Add(1)
-		go func(show NetflixShow) {
-			defer wg.Done()
-			row := sheet.AddRow()
-			v := reflect.ValueOf(show)
-			for i := range v.NumField() {
-				cell := row.AddCell()
-				cell.Value = fmt.Sprintf("%v", v.Field(i).Interface())
-			}
-		}(show)
-	}
-	wg.Wait()
+	return nil
 }
 
 func handleError(w http.ResponseWriter, err error, message string, code int) {
@@ -169,35 +231,70 @@ func elapseTime(message string) (start, end func()) {
 	return start, end
 }
 
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, 4*1024*1024)) // 4MB buffer
+	},
+}
+
 func handler(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
-	var shows []NetflixShow
-	if err := db.WithContext(ctx).Find(&shows).Error; err != nil {
-		handleError(w, err, "Error fetching Netflix shows", http.StatusInternalServerError)
+	var salaries []Salary
+	if err := db.WithContext(ctx).Find(&salaries).Error; err != nil {
+		handleError(w, err, "Error fetching salaries", http.StatusInternalServerError)
 		return
 	}
 
 	file := xlsx.NewFile()
-	sheet, err := file.AddSheet("Netflix Shows")
+	sheet, err := file.AddSheet("Salaries")
 	if err != nil {
-		handleError(w, err, "Error adding sheet", http.StatusInternalServerError)
+		handleError(w, err, "Error creating sheet", http.StatusInternalServerError)
 		return
 	}
 
-	addHeaders(sheet, excelHeaders)
+	tags, err := getFieldTags(Salary{}, "xlsx")
+	if err != nil {
+		handleError(w, err, "Error getting field tags", http.StatusInternalServerError)
+		return
+	}
 
-	start, end := elapseTime("Adding rows with goroutines")
+	addHeaders(sheet, tags)
+
+	start, end := elapseTime("Adding rows")
 	start()
-	addRows(sheet, shows)
+	if err := addRows(sheet, salaries); err != nil {
+		handleError(w, err, "Error generating rows", http.StatusInternalServerError)
+		return
+	}
 	end()
 
-	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-	w.Header().Set("Content-Disposition", "attachment; filename=netflix_shows.xlsx")
+	// Get buffer from pool
+	buf := bufferPool.Get().(*bytes.Buffer)
+	defer bufferPool.Put(buf)
+	buf.Reset()
 
-	if err := file.Write(w); err != nil {
-		handleError(w, err, "Error writing response", http.StatusInternalServerError)
+	// Set headers before writing data
+	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	w.Header().Set("Content-Disposition", "attachment; filename=salaries.xlsx")
+
+	// Stream directly to response with compression
+	startWriting, endWriting := elapseTime("Writing file")
+	startWriting()
+
+	// Write to buffer first
+	if err := file.Write(buf); err != nil {
+		handleError(w, err, "Error writing file", http.StatusInternalServerError)
 		return
 	}
+
+	// Set content length and copy from buffer
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	if _, err := buf.WriteTo(w); err != nil {
+		log.Printf("Error writing response: %v", err)
+	}
+
+	endWriting()
+
 }
