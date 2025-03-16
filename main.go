@@ -6,7 +6,10 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"sync"
 	"time"
+
+	"context"
 
 	"github.com/joho/godotenv"
 	"github.com/tealeg/xlsx"
@@ -36,8 +39,11 @@ type NetflixShow struct {
 	Description string    `xlsx:"Description"`
 }
 
-var db *gorm.DB
-var headers []string
+var (
+	db           *gorm.DB
+	excelHeaders []string
+	fieldIndexes []int
+)
 
 func setupDatabase() (*gorm.DB, error) {
 	if os.Getenv("DATABASE_URL") == "" {
@@ -63,13 +69,21 @@ func setupDatabase() (*gorm.DB, error) {
 	return db, nil
 }
 
-func getFieldTags(model any, tagName string) []string {
-	t := reflect.TypeOf(model)
-	tags := make([]string, t.NumField())
+func initFieldMetadata() {
+	t := reflect.TypeOf(NetflixShow{})
+
+	excelHeaders = make([]string, t.NumField())
+	fieldIndexes = make([]int, t.NumField())
+
 	for i := range t.NumField() {
-		tags[i] = t.Field(i).Tag.Get(tagName)
+		field := t.Field(i)
+		if tag := field.Tag.Get("xlsx"); tag != "" {
+			excelHeaders[i] = tag
+		} else {
+			excelHeaders[i] = field.Name
+		}
+		fieldIndexes[i] = i
 	}
-	return tags
 }
 
 func init() {
@@ -83,13 +97,20 @@ func init() {
 		log.Fatalf("Error setting up database: %v", err)
 	}
 
-	headers = getFieldTags(NetflixShow{}, "xlsx")
+	initFieldMetadata()
 }
 
 func main() {
-	http.HandleFunc("/export", handler)
-	log.Println("Server started on :8080")
-	log.Fatal(http.ListenAndServe(serverAddress, nil))
+	server := &http.Server{
+		Addr:         "localhost:8080",
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		Handler:      http.DefaultServeMux,
+	}
+
+	http.HandleFunc("/download", handler)
+	log.Printf("Starting server on %s", serverAddress)
+	log.Fatal(server.ListenAndServe())
 }
 
 func addHeaders(sheet *xlsx.Sheet, tags []string) {
@@ -111,15 +132,49 @@ func addRows(sheet *xlsx.Sheet, shows []NetflixShow) {
 	}
 }
 
+func addRowsWithGorutines(sheet *xlsx.Sheet, shows []NetflixShow) {
+	var wg sync.WaitGroup
+	for _, show := range shows {
+		wg.Add(1)
+		go func(show NetflixShow) {
+			defer wg.Done()
+			row := sheet.AddRow()
+			v := reflect.ValueOf(show)
+			for i := range v.NumField() {
+				cell := row.AddCell()
+				cell.Value = fmt.Sprintf("%v", v.Field(i).Interface())
+			}
+		}(show)
+	}
+	wg.Wait()
+}
+
 func handleError(w http.ResponseWriter, err error, message string, code int) {
 	log.Printf("%s: %v", message, err)
 	http.Error(w, message, code)
 }
 
+func elapseTime(message string) (start, end func()) {
+	var startTime, endTime time.Time
+
+	start = func() {
+		startTime = time.Now()
+	}
+
+	end = func() {
+		endTime = time.Now()
+		fmt.Printf("Elapsed time for %s: %v \n", message, endTime.Sub(startTime))
+	}
+
+	return start, end
+}
+
 func handler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
 	var shows []NetflixShow
-	if err := db.WithContext(ctx).Limit(10).Find(&shows).Error; err != nil {
+	if err := db.WithContext(ctx).Find(&shows).Error; err != nil {
 		handleError(w, err, "Error fetching Netflix shows", http.StatusInternalServerError)
 		return
 	}
@@ -131,8 +186,12 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	addHeaders(sheet, headers)
+	addHeaders(sheet, excelHeaders)
+
+	start, end := elapseTime("Adding rows with goroutines")
+	start()
 	addRows(sheet, shows)
+	end()
 
 	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 	w.Header().Set("Content-Disposition", "attachment; filename=netflix_shows.xlsx")
