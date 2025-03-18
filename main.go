@@ -1,8 +1,10 @@
 package main
 
 import (
-	"context"
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -11,8 +13,6 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/xuri/excelize/v2"
-	"gorm.io/driver/postgres"
-	"gorm.io/gorm"
 )
 
 const (
@@ -22,104 +22,64 @@ const (
 	connMaxLifetime = 5 * time.Minute
 )
 
-type Tabler interface {
-	TableName() string
+type DATA struct {
+	ConvocatoriaID  int    `json:"convocatoria_id" xlsx:"Convocatoria ID"`
+	CodigoSolicitud string `json:"codigo_solicitud" xlsx:"Codigo Solicitud"`
+	Nombres         string `json:"nombres" xlsx:"Nombres"`
+	Apellidos       string `json:"apellidos" xlsx:"Apellidos"`
+	Identificacion  string `json:"identificacion" xlsx:"Identificacion"`
+	Email           string `json:"email" xlsx:"Email"`
+	Telefono        string `json:"telefono" xlsx:"Telefono"`
+	Institucion     string `json:"institucion" xlsx:"Institucion"`
+	Edad            int    `json:"edad" xlsx:"Edad"`
+	FechaNacimiento string `json:"fecha_nacimiento" xlsx:"Fecha Nacimiento"`
+	Genero          string `json:"genero" xlsx:"Genero"`
+	Direccion       string `json:"direccion" xlsx:"Direccion"`
+	Municipio       string `json:"municipio" xlsx:"Municipio"`
+	ProvinciaNombre string `json:"provincia_nombre" xlsx:"Provincia"`
+	CampusNombre    string `json:"campus_nombre" xlsx:"Campus"`
+	CarreraNombre   string `json:"carrera_nombre" xlsx:"Carrera"`
+	AreaCarrera     string `json:"area_carrera" xlsx:"Area Carrera"`
+	GradoNombre     string `json:"grado_nombre" xlsx:"Grado"`
+	PaisNombre      string `json:"pais_nombre" xlsx:"Pais"`
+	Modalidad       string `json:"modalidad" xlsx:"Modalidad"`
+	EstadoNombre    string `json:"estado_nombre" xlsx:"Estado"`
+	Puntaje         int    `json:"puntaje" xlsx:"Puntaje"`
+	Comentario      string `json:"comentario" xlsx:"Comentario"`
 }
 
-func (Salary) TableName() string {
-	return "salary"
+type Links struct {
+	First string  `json:"first"`
+	Last  string  `json:"last"`
+	Prev  *string `json:"prev"`
+	Next  *string `json:"next"`
 }
 
-type Salary struct {
-	EmployeeId int       `xlsx:"Employee ID"`
-	Amount     float32   `xlsx:"Amount"`
-	FromDate   time.Time `xlsx:"From Date"`
-	ToDate     time.Time `xlsx:"To Date"`
+type Meta struct {
+	CurrentPage int    `json:"current_page"`
+	From        int    `json:"from"`
+	LastPage    int    `json:"last_page"`
+	Links       []Link `json:"links"`
+	Path        string `json:"path"`
+	PerPage     int    `json:"per_page"`
+	To          int    `json:"to"`
+	Total       int    `json:"total"`
 }
 
-func (Title) TableName() string {
-	return "title"
+type Link struct {
+	URL    *string `json:"url"`
+	Label  string  `json:"label"`
+	Active bool    `json:"active"`
 }
 
-type Title struct {
-	EmployeeId int       `xlsx:"Employee ID"`
-	Title      string    `xlsx:"Title"`
-	FromDate   time.Time `xlsx:"From Date"`
-	ToDate     time.Time `xlsx:"To Date"`
-}
-
-func (Employee) TableName() string {
-	return "employee"
-}
-
-type Employee struct {
-	Id        int       `xlsx:"ID"`
-	BirthDate time.Time `xlsx:"Birth Date"`
-	FirstName string    `xlsx:"First Name"`
-	LastName  string    `xlsx:"Last Name"`
-	Gender    string    `xlsx:"Gender"`
-	HireDate  time.Time `xlsx:"Hire Date"`
-}
-
-type EmployeeSalary struct {
-	Employee
-	Salary
-	Title
-}
-
-type NetflixShow struct {
-	ShowID      string    `xlsx:"Id"`
-	Type        string    `xlsx:"Type"`
-	Title       string    `xlsx:"Title"`
-	Director    string    `xlsx:"Director"`
-	CastMembers string    `xlsx:"Cast Members"`
-	Country     string    `xlsx:"Country"`
-	DateAdded   time.Time `xlsx:"Date Added"`
-	ReleaseYear int       `xlsx:"Release Year"`
-	Rating      string    `xlsx:"Rating"`
-	Duration    string    `xlsx:"Duration"`
-	ListedIn    string    `xlsx:"Listed In"`
-	Description string    `xlsx:"Description"`
-}
-
-var (
-	db *gorm.DB
-)
-
-func setupDatabase() (*gorm.DB, error) {
-	if os.Getenv("DATABASE_URL") == "" {
-		return nil, fmt.Errorf("DATABASE_URL environment variable is required")
-	}
-
-	db, err := gorm.Open(postgres.Open(os.Getenv("DATABASE_URL")), &gorm.Config{
-		SkipDefaultTransaction: true,
-		PrepareStmt:            true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error connecting to database: %w", err)
-	}
-
-	sqlDB, err := db.DB()
-	if err != nil {
-		return nil, fmt.Errorf("error getting database instance: %w", err)
-	}
-	sqlDB.SetMaxOpenConns(maxOpenConns)
-	sqlDB.SetMaxIdleConns(maxIdleConns)
-	sqlDB.SetConnMaxLifetime(connMaxLifetime)
-
-	return db, nil
+type APIError struct {
+	Message string `json:"message"`
 }
 
 func init() {
 	if err := godotenv.Load(); err != nil {
 		log.Printf("Warning: .env file not found, using environment variables")
 	}
-
-	// var err error
-	// db, err = setupDatabase()
-	// if err != nil {
-	// 	log.Fatalf("Error setting up database: %v", err)
-	// }
 }
 
 func main() {
@@ -130,7 +90,7 @@ func main() {
 		Handler:      http.DefaultServeMux,
 	}
 
-	http.HandleFunc("/download", handler)
+	http.HandleFunc("GET /download", handler)
 	log.Printf("Starting server on %s", serverAddress)
 	log.Fatal(server.ListenAndServe())
 }
@@ -147,7 +107,7 @@ func getHeaders[T any](model T) ([]string, error) {
 		t = t.Elem()
 	}
 
-	for i := 0; i < t.NumField(); i++ {
+	for i := range t.NumField() {
 		field := t.Field(i)
 		if field.Type.Kind() == reflect.Struct && field.Anonymous {
 			nestedHeaders, err := getHeaders(reflect.New(field.Type).Interface())
@@ -156,24 +116,24 @@ func getHeaders[T any](model T) ([]string, error) {
 			}
 			headers = append(headers, nestedHeaders...)
 		} else {
-			headers = append(headers, field.Tag.Get("xlsx"))
+			headers = append(headers, field.Tag.Get("json"))
 		}
 	}
 
 	return headers, nil
 }
 
-func getRows[T any](data []T) ([][]interface{}, error) {
-	var rows [][]interface{}
+func getRows[T any](data []T) ([][]any, error) {
+	var rows [][]any
 
 	for _, item := range data {
-		var row []interface{}
+		var row []any
 		v := reflect.ValueOf(item)
 		if v.Kind() == reflect.Ptr {
 			v = v.Elem()
 		}
 
-		for i := 0; i < v.NumField(); i++ {
+		for i := range v.NumField() {
 			field := v.Field(i)
 			if !field.IsValid() {
 				return nil, fmt.Errorf("invalid field at position %d", i)
@@ -208,20 +168,69 @@ func elapseTime(message string) (start, end func()) {
 	return start, end
 }
 
-func getData(ctx context.Context, w http.ResponseWriter) ([]Salary, error) {
+func getData(convocationId string) (*[]DATA, error) {
 	start, end := elapseTime("Fetching data")
 	start()
 
-	var salaries []Salary
+	var apiResponse []DATA
 
-	if err := db.WithContext(ctx).Find(&salaries).Error; err != nil {
-		handleError(w, err, "Error fetching salaries", http.StatusInternalServerError)
-		end()
-		return nil, err
+	// Fetch apiResponse with API_URL and set Authorization header with Bearer token
+	apiURL := os.Getenv("API_URL")
+	token := os.Getenv("API_TOKEN")
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/api/backoffice/v1/solicitud/excel?convocatoria=%s", apiURL, convocationId), nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	log.Printf("Requesting data from %s", req.URL.String())
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+
+	client := &http.Client{
+		Timeout: 5 * time.Minute,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error sending request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error reading response body: %w", err)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if resp.StatusCode != http.StatusOK {
+		if contentType == "application/json" {
+			var apiError APIError
+			if err := json.Unmarshal(body, &apiError); err != nil {
+				return nil, fmt.Errorf("error decoding error response: %w", err)
+			}
+			return nil, fmt.Errorf("error response from API: %s", apiError.Message)
+		} else {
+			return nil, fmt.Errorf("error response from API: %s", string(body))
+		}
+	}
+
+	if contentType != "application/json" {
+		return nil, fmt.Errorf("unexpected content type: %s", contentType)
+	}
+
+	// print json idented
+	var prettyJSON bytes.Buffer
+	if err := json.Indent(&prettyJSON, body, "", "  "); err != nil {
+		return nil, fmt.Errorf("error indenting json: %w", err)
+	}
+	log.Printf("Response: %s", prettyJSON.String())
+
+	if err := json.Unmarshal(body, &apiResponse); err != nil {
+		return nil, fmt.Errorf("error decoding response: %w", err)
 	}
 
 	end()
-	return salaries, nil
+	return &apiResponse, nil
 }
 
 func downloadFile[T any](w http.ResponseWriter, data []T) error {
@@ -256,7 +265,7 @@ func downloadFile[T any](w http.ResponseWriter, data []T) error {
 	}
 
 	w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-	w.Header().Set("Content-Disposition", "attachment; filename=salaries.xlsx")
+	w.Header().Set("Content-Disposition", "attachment; filename=data.xlsx")
 
 	file.Write(w)
 
@@ -266,22 +275,22 @@ func downloadFile[T any](w http.ResponseWriter, data []T) error {
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
-	// ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
-	// defer cancel()
+	fmt.Println("Downloading data")
 
-	// data, err := getData(ctx, w)
-	// if err != nil {
-	// 	return
-	// }
-
-	data := []Salary{
-		{EmployeeId: 1, Amount: 1000, FromDate: time.Now(), ToDate: time.Now()},
-		{EmployeeId: 2, Amount: 2000, FromDate: time.Now(), ToDate: time.Now()},
-		{EmployeeId: 3, Amount: 3000, FromDate: time.Now(), ToDate: time.Now()},
+	convocationId := r.URL.Query().Get("convocationId")
+	if convocationId == "" {
+		handleError(w, nil, "Missing convocationId", http.StatusBadRequest)
+		return
 	}
 
-	if err := downloadFile(w, data); err != nil {
-		handleError(w, err, "Error streaming salaries", http.StatusInternalServerError)
+	apiResponse, err := getData(convocationId)
+	if err != nil {
+		handleError(w, err, "Error fetching data", http.StatusInternalServerError)
+		return
+	}
+
+	if err := downloadFile(w, *apiResponse); err != nil {
+		handleError(w, err, "Error creating file", http.StatusInternalServerError)
 		return
 	}
 }
